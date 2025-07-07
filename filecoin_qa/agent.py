@@ -98,6 +98,7 @@ class FilecoinQAAgent:
         Question: {question}
         
         Answer in markdown format. Include code snippets where relevant, and always link to the source files or issues.
+        If this is the first question in a conversation and no specific question is asked, respond with a helpful welcome message explaining what kind of questions I can answer about Filecoin.
         Helpful Answer:"""
 
         return ConversationalRetrievalChain.from_llm(
@@ -108,7 +109,8 @@ class FilecoinQAAgent:
             memory=self.memory,
             condense_question_prompt=CONDENSE_QUESTION_PROMPT,
             combine_docs_chain_kwargs={"prompt": PromptTemplate.from_template(qa_prompt_template)},
-            return_source_documents=True
+            return_source_documents=True,
+            return_generated_question=True
         )
 
     def index_repositories(self, force: bool = False) -> None:
