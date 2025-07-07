@@ -86,7 +86,10 @@ def ask(
         while True:
             try:
                 question = Prompt.ask("\n[bold blue]?[/bold blue]")
+                if not question:  # Skip empty questions
+                    continue
                 if question.lower() in ("exit", "quit"):
+                    console.print("\nGoodbye! 👋")
                     break
                 
                 with Progress(
@@ -111,6 +114,7 @@ def ask(
                 break
             except Exception as e:
                 console.print(f"\n[red]Error:[/red] {str(e)}")
+                continue  # Continue the loop even after errors
     
     # Single question mode
     else:
