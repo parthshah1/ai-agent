@@ -69,7 +69,8 @@ class VectorStore:
         if self.cache_dir.exists():
             self.store = FAISS.load_local(
                 str(self.cache_dir),
-                self.embeddings
+                self.embeddings,
+                allow_dangerous_deserialization=True  # Safe as we're loading our own cached data
             )
             return True
         return False

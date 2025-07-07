@@ -32,7 +32,7 @@ class FilecoinQAAgent:
         github_token: Optional[str] = None,
         openai_api_key: Optional[str] = None,
         cache_dir: Optional[Union[str, Path]] = None,
-        model_name: str = "gpt-4-turbo-preview"
+        model_name: str = "gpt-3.5-turbo"
     ):
         """Initialize the QA agent.
         
@@ -61,7 +61,8 @@ class FilecoinQAAgent:
         )
         self.memory = ConversationBufferMemory(
             memory_key="chat_history",
-            return_messages=True
+            return_messages=True,
+            output_key="answer"
         )
         
         # Initialize QA chain only if vector store is loaded
