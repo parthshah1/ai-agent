@@ -14,17 +14,18 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 
 from filecoin_qa.loaders.github import FilecoinGitHubLoader, split_documents
-from filecoin_qa.indexing.store import VectorStore
+from filecoin_qa.indexing.store import VectorStore, SourceType
 
 # Default repositories to index
 DEFAULT_REPOS = [
-    "filecoin-project/lotus",
-    "filecoin-project/specs-actors",
-    "filecoin-project/FIPs"
+    "filecoin-project/lotus",  # Reference implementation
+    "filecoin-project/builtin-actors",  # Core protocol actors
+    "filecoin-project/FIPs",  # Filecoin Improvement Proposals
+    "filecoin-project/specs"  # Original specs (may be outdated)
 ]
 
 class FilecoinQAAgent:
-    """Agent for answering questions about Filecoin."""
+    """Agent for answering questions about Filecoin with source prioritization."""
 
     def __init__(
         self,
@@ -32,7 +33,7 @@ class FilecoinQAAgent:
         github_token: Optional[str] = None,
         openai_api_key: Optional[str] = None,
         cache_dir: Optional[Union[str, Path]] = None,
-        model_name: str = "gpt-3.5-turbo"
+        model_name: str = "gpt-4-turbo-preview"  # Using GPT-4 for better reasoning
     ):
         """Initialize the QA agent.
         
@@ -56,7 +57,7 @@ class FilecoinQAAgent:
         self.vector_store = VectorStore(cache_dir=cache_dir)
         self.llm = ChatOpenAI(
             model=model_name,
-            temperature=0.0,
+            temperature=0.0,  # Keep it factual
             api_key=self.openai_api_key
         )
         self.memory = ConversationBufferMemory(
@@ -71,7 +72,7 @@ class FilecoinQAAgent:
             self.qa_chain = self._create_qa_chain()
 
     def _create_qa_chain(self) -> ConversationalRetrievalChain:
-        """Create the QA chain with custom prompts."""
+        """Create the QA chain with source-aware prompts."""
         if self.vector_store.store is None:
             raise RuntimeError("Vector store not initialized. Run index_repositories() first.")
             
@@ -85,26 +86,40 @@ class FilecoinQAAgent:
         Follow Up Input: {question}
         Standalone question:""")
 
-        qa_prompt_template = """You are an expert on the Filecoin project and its codebase.
+        qa_prompt_template = """You are an expert on the Filecoin project and its protocol and codebase.
         Use the following pieces of context to answer the question at the end.
         If you don't know the answer, just say that you don't know, don't try to make up an answer.
-        Always include references to the source code, documentation, or issues that you used to answer the question.
-        You should always use the latest version of the codebase, you can read filecoin specs but those are outdated. FIP's are the most up to date.
         
-
+        The context comes from different sources with varying authority:
+        1. FIPs (Filecoin Improvement Proposals) - Most authoritative for current protocol rules
+        2. Code (Implementation) - Source of truth for actual behavior
+        3. Specs - May be outdated but provide good background
+        4. Issues/PRs - Provide discussion context
+        
+        If sources conflict, prefer FIPs over specs, and implementation over documentation.
+        Always cite your sources using markdown links.
+        
+        For each fact in your answer, indicate which source supports it.
+        If a spec says one thing but a FIP changed it, explain the change.
+        
         Context:
         {context}
 
         Question: {question}
         
-        Answer in markdown format. Include code snippets where relevant, and always link to the source files or issues.
-        If this is the first question in a conversation and no specific question is asked, respond with a helpful welcome message explaining what kind of questions I can answer about Filecoin.
+        Answer in markdown format. Include code snippets where relevant.
+        If this is the first question in a conversation and no specific question is asked,
+        respond with a helpful welcome message explaining what kind of questions I can answer about Filecoin.
+        
         Helpful Answer:"""
 
         return ConversationalRetrievalChain.from_llm(
             llm=self.llm,
             retriever=self.vector_store.store.as_retriever(
-                search_kwargs={"k": int(os.getenv("TOP_K", "5"))}
+                search_kwargs={
+                    "k": int(os.getenv("TOP_K", "5")),
+                    "min_score": 0.3  # Minimum relevance threshold
+                }
             ),
             memory=self.memory,
             condense_question_prompt=CONDENSE_QUESTION_PROMPT,
@@ -143,20 +158,29 @@ class FilecoinQAAgent:
             question: The question to ask
         
         Returns:
-            Dict containing the answer and source documents
+            Dict containing the answer, source documents, and their weights
         """
         if not self.vector_store.store or not self.qa_chain:
             raise RuntimeError("No indexed documents. Run index_repositories() first.")
         
         result = self.qa_chain({"question": question})
         
+        # Include source weights in response
+        sources = []
+        for doc in result["source_documents"]:
+            source_type = doc.metadata.get("source_type", "OTHER")
+            source_weight = doc.metadata.get("source_weight", SourceType.OTHER.value)
+            sources.append({
+                "content": doc.page_content,
+                "metadata": {
+                    **doc.metadata,
+                    "source_type": source_type,
+                    "source_weight": source_weight
+                }
+            })
+        
         return {
             "answer": result["answer"],
-            "sources": [
-                {
-                    "content": doc.page_content,
-                    "metadata": doc.metadata
-                }
-                for doc in result["source_documents"]
-            ]
+            "sources": sources,
+            "generated_question": result.get("generated_question")
         } 

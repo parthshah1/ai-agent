@@ -1,9 +1,11 @@
-"""GitHub repository content loader."""
+"""GitHub repository content loader with source-aware chunking."""
 
 import os
 import logging
+import re
 from typing import List, Optional, Dict, Any, Literal
 from pathlib import Path
+from datetime import datetime
 
 from langchain_community.document_loaders import GithubFileLoader, GitHubIssuesLoader
 from langchain_core.documents import Document
@@ -12,8 +14,60 @@ from github.MainClass import Github
 
 logger = logging.getLogger(__name__)
 
+def split_documents(documents: List[Document], chunk_size: int = 1000) -> List[Document]:
+    """Split documents into chunks with source-aware splitting.
+    
+    Args:
+        documents: List of documents to split
+        chunk_size: Target size for each chunk
+        
+    Returns:
+        List of chunked documents
+    """
+    # Custom splitters for different file types
+    code_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=200,
+        separators=["\n\n", "\n", " ", ""],
+        keep_separator=True
+    )
+    
+    markdown_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=200,
+        separators=["\n## ", "\n# ", "\n### ", "\n\n", "\n", " "],
+        keep_separator=True
+    )
+    
+    chunks = []
+    for doc in documents:
+        try:
+            # Choose splitter based on file type
+            is_markdown = doc.metadata.get("file_path", "").endswith((".md", ".mdx"))
+            splitter = markdown_splitter if is_markdown else code_splitter
+            
+            # Split the document
+            doc_chunks = splitter.split_documents([doc])
+            
+            # Enhance chunk metadata
+            for i, chunk in enumerate(doc_chunks):
+                chunk.metadata.update({
+                    "chunk_index": i,
+                    "total_chunks": len(doc_chunks),
+                    "processed_at": datetime.utcnow().isoformat()
+                })
+            
+            chunks.extend(doc_chunks)
+            
+        except Exception as e:
+            logger.warning(f"Failed to split document {doc.metadata.get('file_path')}: {str(e)}")
+            # Keep original document if splitting fails
+            chunks.append(doc)
+            
+    return chunks
+
 class FilecoinGitHubLoader:
-    """Loads content from Filecoin GitHub repositories."""
+    """Loads content from Filecoin GitHub repositories with source type awareness."""
 
     def __init__(
         self,
@@ -33,7 +87,14 @@ class FilecoinGitHubLoader:
         self.repo = repo
         self.branch = branch
         self.access_token = access_token or os.getenv("GITHUB_TOKEN")
-        self.file_filter = file_filter or [".go", ".md", ".ts", ".js", ".py"]
+        self.file_filter = file_filter or [
+            # Code files
+            ".go", ".rs", ".ts", ".js", ".py",
+            # Documentation
+            ".md", ".mdx",
+            # Config files that might have comments
+            ".toml", ".yaml", ".json"
+        ]
         
         if not self.access_token:
             raise ValueError("GitHub token is required. Set GITHUB_TOKEN env var.")
@@ -42,14 +103,47 @@ class FilecoinGitHubLoader:
         self.github_client = Github(self.access_token)
 
     def _should_load_file(self, path: str) -> bool:
-        """Check if file should be loaded based on extension."""
+        """Check if file should be loaded based on extension and path."""
+        # Skip test files and examples unless in FIPs repo
+        if not "FIPs" in self.repo and any(x in path.lower() for x in ["/test/", "/tests/", "/example"]):
+            return False
+            
         return any(path.endswith(ext) for ext in self.file_filter)
 
+    def _extract_fip_metadata(self, content: str, path: str) -> Dict[str, Any]:
+        """Extract metadata from FIP document.
+        
+        Args:
+            content: FIP document content
+            path: File path
+            
+        Returns:
+            Dictionary of FIP metadata
+        """
+        metadata = {}
+        
+        # Try to extract FIP number
+        fip_match = re.search(r"FIP-(\d+)", path)
+        if fip_match:
+            metadata["fip_number"] = int(fip_match.group(1))
+            
+        # Try to extract status
+        status_match = re.search(r"status:\s*(\w+)", content, re.IGNORECASE)
+        if status_match:
+            metadata["status"] = status_match.group(1).lower()
+            
+        # Try to extract title
+        title_match = re.search(r"title:\s*(.+)$", content, re.MULTILINE)
+        if title_match:
+            metadata["title"] = title_match.group(1).strip()
+            
+        return metadata
+
     def load_files(self) -> List[Document]:
-        """Load files from the repository.
+        """Load files from the repository with enhanced metadata.
         
         Returns:
-            List of successfully loaded documents. Files that fail to load are skipped.
+            List of successfully loaded documents
         """
         if not self.access_token:
             raise ValueError("GitHub token is required")
@@ -69,15 +163,27 @@ class FilecoinGitHubLoader:
                         if isinstance(file_content, list):
                             continue  # Skip directories
                             
+                        content = file_content.decoded_content.decode('utf-8')
+                        
+                        # Build base metadata
+                        metadata = {
+                            "source": entry.path,
+                            "file_path": entry.path,
+                            "repo": self.repo,
+                            "type": "file",
+                            "url": f"https://github.com/{self.repo}/blob/{self.branch}/{entry.path}",
+                            "last_modified": file_content.last_modified,
+                            "size": file_content.size
+                        }
+                        
+                        # Add FIP-specific metadata if applicable
+                        if "FIPs" in self.repo and entry.path.endswith(".md"):
+                            fip_metadata = self._extract_fip_metadata(content, entry.path)
+                            metadata.update(fip_metadata)
+                        
                         doc = Document(
-                            page_content=file_content.decoded_content.decode('utf-8'),
-                            metadata={
-                                "source": entry.path,
-                                "file_path": entry.path,
-                                "repo": self.repo,
-                                "type": "file",
-                                "url": f"https://github.com/{self.repo}/blob/{self.branch}/{entry.path}"
-                            }
+                            page_content=content,
+                            metadata=metadata
                         )
                         documents.append(doc)
                         
@@ -87,16 +193,22 @@ class FilecoinGitHubLoader:
                         
         except Exception as e:
             logger.error(f"Failed to access repository {self.repo}: {str(e)}")
-            # Don't raise - return any documents we managed to load
             
         return documents
 
     def load_issues(
         self,
         include_prs: bool = True,
-        state: Literal["open", "closed", "all"] = "all"
+        state: Literal["open", "closed", "all"] = "all",
+        labels: Optional[List[str]] = None
     ) -> List[Document]:
-        """Load issues and optionally PRs from the repository."""
+        """Load issues and optionally PRs from the repository.
+        
+        Args:
+            include_prs: Whether to include pull requests
+            state: Issue state to include
+            labels: List of labels to filter by
+        """
         if not self.access_token:
             raise ValueError("GitHub token is required")
             
@@ -110,12 +222,20 @@ class FilecoinGitHubLoader:
             
             documents = loader.load()
             
-            # Add metadata
+            # Add enhanced metadata
             for doc in documents:
+                is_pr = doc.metadata.get("is_pull_request", False)
                 doc.metadata.update({
                     "repo": self.repo,
-                    "type": "issue" if not doc.metadata.get("is_pull_request") else "pr"
+                    "type": "pr" if is_pr else "issue",
+                    "processed_at": datetime.utcnow().isoformat()
                 })
+                
+                # Filter by labels if specified
+                if labels:
+                    doc_labels = doc.metadata.get("labels", [])
+                    if not any(label in doc_labels for label in labels):
+                        continue
             
             return documents
             
@@ -124,46 +244,32 @@ class FilecoinGitHubLoader:
             return []
 
     def load_all(self) -> List[Document]:
-        """Load both files and issues/PRs.
+        """Load both files and issues/PRs with comprehensive metadata.
         
         Returns:
-            Combined list of all successfully loaded documents.
-            If either files or issues fail to load, returns documents from the successful operation.
+            Combined list of all successfully loaded documents
         """
         documents = []
         
         try:
+            # Load files first
             documents.extend(self.load_files())
         except Exception as e:
             logger.error(f"Failed to load files from {self.repo}: {str(e)}")
             
         try:
-            documents.extend(self.load_issues())
+            # Load issues with specific labels for FIPs
+            if "FIPs" in self.repo:
+                documents.extend(self.load_issues(
+                    labels=["fip", "Final", "Last Call", "Active"]
+                ))
+            else:
+                # For other repos, focus on merged PRs and important issues
+                documents.extend(self.load_issues(
+                    state="closed",
+                    labels=["merged", "important", "documentation"]
+                ))
         except Exception as e:
             logger.error(f"Failed to load issues from {self.repo}: {str(e)}")
             
-        return documents
-
-def split_documents(
-    documents: List[Document],
-    chunk_size: int = 1000,
-    chunk_overlap: int = 200
-) -> List[Document]:
-    """Split documents into chunks for embedding.
-    
-    Args:
-        documents: List of documents to split
-        chunk_size: Maximum chunk size in characters
-        chunk_overlap: Number of characters to overlap between chunks
-    
-    Returns:
-        List of chunked documents
-    """
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=len,
-        separators=["\n\n", "\n", " ", ""]
-    )
-    
-    return text_splitter.split_documents(documents) 
+        return documents 
